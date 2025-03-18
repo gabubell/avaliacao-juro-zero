@@ -1,0 +1,975 @@
+---
+title: "Impacto do Juro Zero"
+output: 
+  html_document:
+    number_sections: true
+    df_print: paged
+---
+
+# Definições Iniciais 
+
+```{r, include = FALSE}
+
+knitr::opts_chunk$set(
+    warning = F
+    )
+```
+
+
+```{r}
+library(tidyverse)
+library(basedosdados)
+library(RSelenium)
+library(JavaGD)
+library(httr)
+library(sidrar)
+library(abjutils)
+library(MatchIt)
+library(brglm)
+library(ggplot2)
+```
+
+# Introdução 
+
+<font size = "1"> 
+Nota: este trabalho é um resumo do TCC [Impacto do programa Juro Zero: redução da informalidade nos municípios catarinenses entre 2012 e 2019.](https://repositorio.ufsc.br/bitstream/handle/123456789/227959/tcc_GabrielBelle.pdf?sequence=1). 
+</font>
+
+O objetivo final é a estimação do impacto médio do programa Juro Zero, eliminando fatores externos, como tendências e outros cofundidores. Para tanto, faz-se necessário:
+
+a) Coletar os dados de interesse;
+b) Definir a variável de impacto;
+c) Selecionar covariadas de controle;
+d) Selecionar o grupo de controle e tratamento;
+e) Estimar o impacto médio do programa.
+
+# Coleta de dados
+
+Os dados necessários à variável de impacto necessitam de informações antes e depois do programa.
+
+Já os dados para criação do grupo de controle e para o filtro do grupo de tratamento, via PSM, possuem apenas a necessidade de existência pré-programa. Isto leva a uma maior flexibilidade, pois há disponibilidade para uso do Censo geográfico brasileiro, com última informação disponível para 2010. Sua utilização deve levar a uma maior robustez para o trabalho. 
+
+Para os dados do Censo 2010 e da RAIS utilizado a https://basedosdados.org/. Desta forma, pode-se recuperar os dados utilizando uma consulta em SQL. 
+
+Ps: Note that I store the output so it doesn’t need to be executed repeatedly, when I was testing my script.
+
+## Dados do Censo de 2010
+
+Os dados a serem coletados do censo provém da base mais rica disponível, feito apenas em parcela da população. Como o próprio IBGE divulga o peso de cada indivíduo, referente à população, a extrapolação da amostra é feita de forma direta. 
+
+Coletaremos dados sobre tamanho da população, população ocupada que recebe pagamento em dinheiro, o tipo de ocupação do trabalhador (CLT, militar, publico...) e a população economicamente ativa (PEA).
+
+Como a opção pelo MEI é disponível apenas para os solicitantes em maioridade, optou-se para filtrar todas as informações para maioridade.
+
+```{r, eval = F}
+set_billing_id('impact-juro-zero-sc')
+```
+
+```{r, eval = F}
+query_censo <- 'SELECT sigla_uf, id_municipio,
+    SUM(peso_amostral) AS pop, 
+    SUM(case when (v6036 >= 18) 
+        then peso_amostral else 0 end) AS pop_maioridade,
+    SUM(case when (v0641 = 1 OR v0642 = 1) AND
+        v6036 >= 18 then peso_amostral else 0 end) AS ocupado_maioridade_dinheiro,
+    SUM(case when (v0648 = 1 AND v6036 >= 18) then peso_amostral else 0 end) AS ocupacao_clt,
+    SUM(case when (v0648 = 2 AND v6036 >= 18) then peso_amostral else 0 end) AS ocupacao_militar,
+    SUM(case when (v0648 = 3 AND v6036 >= 18) then peso_amostral else 0 end) AS ocupacao_publico,
+    SUM(case when (v0648 = 4 AND v6036 >= 18) then peso_amostral else 0 end) AS ocupacao_sem_carteira,
+    SUM(case when (v0648 = 5 AND v6036 >= 18) then peso_amostral else 0 end) AS ocupacao_conta_propria,
+    SUM(case when (v0648 = 6 AND v6036 >= 18) then peso_amostral else 0 end) AS ocupacao_empregador,
+    SUM(case when (v0648 = 7 AND v6036 >= 18) then peso_amostral else 0 end) AS ocupacao_sem_remuneracao,
+    SUM(case when (v6036 >= 18) then peso_amostral * v6525 else 0 end) AS massa_salario_maioridade,
+    SUM(case when (v6900 = 1 AND v6036 >= 18) then peso_amostral else 0 end) AS pea_maioridade,
+    SUM(case when (v6900 = 2 AND v6036 >= 18) then peso_amostral else 0 end) AS fora_pea_maioridade,
+    SUM(case when (v6910 = 1 AND v6036 >= 18) then peso_amostral else 0 end) AS ocupada_maioridade,
+    SUM(case when (v6910 = 2 AND v6036 >= 18) then peso_amostral else 0 end) AS desocupada_maioridade
+FROM `basedosdados.br_ibge_censo_demografico.microdados_pessoa_2010`
+WHERE (sigla_uf = "SC" OR sigla_uf = "SP")
+GROUP BY sigla_uf, id_municipio'
+
+censo_raw <- read_sql(query_censo)
+saveRDS(censo_raw, 'censo_raw.rds') 
+```
+
+```{r}  
+censo_raw <- readRDS('censo_raw.rds') 
+```
+
+## Dados do RAIS
+
+A Relação Anual dos Trabalhadores (RAIS) divulga informações de periodicidade anual que são fornecidades a nível de estabelecimento. 
+
+Serão coletados dados de:
+
+a) Quantidade de estabelecimentos negativos em 2008
+```{r, eval = F}
+query_rais_a <- 'SELECT sigla_uf,
+id_municipio,
+SUM(indicador_rais_negativa) AS rais_negativa,
+COUNT(indicador_atividade_ano) AS qtd_total_empresas
+FROM `basedosdados.br_me_rais.microdados_estabelecimentos`
+WHERE ((sigla_uf = "SC" OR sigla_uf = "SP") AND (ano = 2008))
+GROUP BY sigla_uf, id_municipio'
+
+rais_a_raw <- read_sql(query_rais_a)
+saveRDS(rais_a_raw, 'rais_a_raw.rds') 
+```
+
+```{r}
+rais_a_raw <- readRDS('rais_a_raw.rds') %>% 
+  mutate(id_municipio = id_municipio %>% 
+           as.character())
+```
+
+b) Quantidade de estoque de emprego por CNAE
+
+Os dados serão recuperados para 2011. 
+
+```{r, eval = F}
+query_rais_b <- 'SELECT sigla_uf, id_municipio, SUM(qtde_vinculos_ativos) AS total_estoque, 
+SUM(CASE WHEN CAST(SUBSTR(cnae_2,1,2) AS INT) < 10 THEN qtde_vinculos_ativos ELSE 0 END) AS agro_extracao,
+SUM(CASE WHEN (
+    (
+        CAST(SUBSTR(cnae_2,1,2) AS INT) BETWEEN 10 AND 33) OR (
+            CAST(SUBSTR(cnae_2, 1,2) AS INT) BETWEEN 41 AND 43))
+            THEN qtde_vinculos_ativos ELSE 0 END) AS industria_construcao,
+SUM(CASE WHEN CAST(SUBSTR(cnae_2,1,2) AS INT) BETWEEN 35 AND 39 THEN qtde_vinculos_ativos ELSE 0 END) AS siup,
+SUM(CASE WHEN CAST(SUBSTR(cnae_2, 1, 2) AS INT) BETWEEN 45 AND 47 THEN qtde_vinculos_ativos ELSE 0 END) AS comercio,
+SUM(CASE WHEN CAST(SUBSTR(cnae_2,1,2) AS INT) BETWEEN 49 AND 99 THEN qtde_vinculos_ativos ELSE 0 END) AS servico,
+FROM `basedosdados.br_me_rais.microdados_estabelecimentos`
+WHERE ((sigla_uf = "SC" OR sigla_uf = "SP") AND (ano = 2011))
+GROUP BY sigla_uf, id_municipio'
+
+rais_b_raw <- read_sql(query_rais_b)
+saveRDS(rais_b_raw, 'rais_b_raw.rds') 
+```
+
+```{r}
+rais_b_raw <- readRDS('rais_b_raw.rds')  %>% 
+  mutate(id_municipio = id_municipio %>% 
+           as.character())
+```
+
+c) Quantidade de emprego em 31/12:
+
+O tamanho da empresa indica quantas pessoas trabalham no estabelecimento em 31 de dezembro, contabilizado o dono. 
+
+```{r, eval = F}
+query_rais_c <- "SELECT ano, sigla_uf, id_municipio, SUM(tamanho_estabelecimento) AS empregos_dezembro
+FROM `basedosdados.br_me_rais.microdados_estabelecimentos`
+WHERE ((sigla_uf = 'SC' OR sigla_uf = 'SP') AND (ano = 2011 OR ano = 2019))
+GROUP BY ano, sigla_uf, id_municipio"
+
+rais_c_raw <- read_sql(query_rais_c)
+saveRDS(rais_c_raw, 'rais_c_raw.rds')
+```
+
+```{r}
+rais_c_raw <- readRDS('rais_c_raw.rds') %>% 
+  mutate(id_municipio = id_municipio %>% 
+           as.character())
+```
+ 
+
+## Dados de quantidade de MEI
+
+Já para os dados da quantidade de inscritos no MEI, faz-se necessário sua coleta tanto no ínicio quanto ao fim do período de análise. A fonte dos dados é a [Receita Federal](http://www22.receita.fazenda.gov.br/inscricaomei/private/pages/relatorios/opcoesRelatorio.jsf). 
+
+Aqui, o método de coleta será uma raspagem (Web Scrapping with Selenium). Esta técnica consiste em simular o comportamento de um humano utilizando comandos vindos da programação. Isto permite escalagem, caso necessário, para coletar todos os dados disponíveis do sistema. 
+
+O pacote escolhido foi o RSelenium.
+
+```{r, eval = F}
+# Carrega a página como teste
+rd <- rsDriver(port = 4444L, browser = c("chrome"), chromever = "105.0.5195.19", phantomver = "2.1.1", verbose = TRUE, check = TRUE)
+
+remDr <- rd[["client"]]
+
+# Acessa a url
+remdr$navigate('http://www22.receita.fazenda.gov.br/inscricaomei/private/pages/relatorios/opcoesRelatorio.jsf')
+
+# Navega até a página de interesse
+municipio <- remdr$findElements('xpath', '//*[@id="1b"]/ul/li[2]/a')
+municipio[[1]]$clickElement()
+```
+
+```{r, eval = F}
+query_dates <- c('30-12-2011', '31-12-2019')
+query_ufs <- c('SÃO PAULO', 'SANTA CATARINA')
+
+extracted_values <- tibble(
+    date = c(),
+    uf = c(),
+    dados = c()
+)
+
+# Por algum motivo a data é apenas inserida após primeiro click no botão de consulta
+
+campo_calendario <- remdr$findElements('id',
+                                       'form:dataPesquisaInputDate')
+
+campo_calendario[[1]]$sendKeysToElement(list('01/01/2010'))
+
+consultar <- remdr$findElements('id', 'form:botaoConsultar')
+consultar[[1]]$clickElement()
+
+# Seleciona botão para coleta de todos municípios
+todos_municipios <- remdr$findElements(
+    'xpath', '//*[@id="form:identificacao_body"]/div[1]/div[2]/div[2]/label')
+todos_municipios[[1]]$clickElement()
+
+# Loop para coleta dos dados
+Sys.sleep(0.1)
+for (dt in query_dates) {
+
+    for (estado in query_ufs) {
+        print(paste(dt, estado))
+
+         # Insere a data
+        campo_calendario <- remdr$findElements('id',
+                                               'form:dataPesquisaInputDate')
+        campo_calendario[[1]]$sendKeysToElement(list(dt))
+
+        # Coleta as UFs disponíveis
+        form_uf <- remdr$findElements('id', 'form:uf')
+        form_uf_options <- form_uf[[1]]$findChildElements('tag name', "option")
+
+        # Seleciona a UF correta
+        for (i in c(1:length(form_uf_options))) {
+            if (form_uf_options[[i]]$getElementText() == estado) {
+
+                form_uf_options[[i]]$clickElement()
+
+            } else {next}
+        }
+
+        # Clica em consultar para gerar a tabela
+        consultar <- remdr$findElements('id', 'form:botaoConsultar')
+        consultar[[1]]$clickElement()
+
+        # Coleta dados da tabela
+        vetor_dados <- c(0,0)
+        extracao_dados <- matrix(0,nrow=1, ncol=2)
+
+        linhas_tabela <- remdr$findElements('class', 'rich-table-row')
+
+        i <- 1
+        for (linha in linhas_tabela) {
+            colunas_tabela <- linha$findChildElements('class', 'rich-table-cell')
+            Sys.sleep(0.1)
+
+            for (coluna in colunas_tabela) {
+                vetor_dados[i] <- coluna$getElementText()[[1]]
+                i <- i + 1
+            }
+
+            i <- 1
+            extracao_dados <- rbind(extracao_dados, vetor_dados)
+        }
+
+        # Exporta os dados para uma variável externa ao loop
+        extracao_dados <- extracao_dados %>%
+            as_tibble(.name_repair = 'unique')
+
+        extracted_values <- extracted_values %>%
+            add_row(
+                date = dt,
+                uf = estado,
+                dados = list(extracao_dados[-1,])
+            )
+
+        print('Feito')
+        Sys.sleep(0.1)
+    }
+}
+
+saveRDS(extracted_values, 'mei_v1.rds')
+```
+
+```{r}
+mei_raw <- readRDS('mei_v1.rds')
+```
+
+## Estimativa da população
+
+O IBGE calcula a estimativa da população anual a nível municipal, dado necessário ao Tibunal de Contas da União. 
+
+O Dado pode ser baixado pela [API do Sidra/IBGE](https://sidra.ibge.gov.br/pesquisa/estimapop/tabelas).
+
+```{r, eval = F}
+pop_estimada_raw <- get_sidra(x = 6579, period = c('2011','2019'), geo = 'City')
+
+saveRDS(pop_estimada_raw, 'pop_estimada_raw.rds')
+```
+
+```{r}
+pop_estimada_raw <- readRDS('pop_estimada_raw.rds')
+```
+
+## Índice de desigualdade e desenvolvimento
+
+Os dados do índice de gini e desenvolvimento humano (2010 census) foram coletados atrás do site [Atlas Brasil](http://www.atlasbrasil.org.br/)
+
+```{r}
+indices_raw <- readxl::read_excel('consulta.xlsx')
+```
+
+## Valor adicionado bruto
+
+Os 9 VABs podem ser recuperados pelo sidra.
+
+```{r, eval = F}
+pib_mun_raw <- get_sidra(api = '/t/5938/n6/all/v/37,498,513,517,6575,525/p/2010/f/n')
+
+saveRDS(pib_mun_raw, 'pib_mun_raw.rds')
+```
+
+```{r}
+pib_mun_raw <- readRDS('pib_mun_raw.rds')
+```
+
+# Tratamento dos dados
+
+Para suportar o processo de modelagem, - base de dados deve estar no mesmo padrão estrutural. Isto permitira sua unificação.
+
+## Como vieram os dados?
+
+```{r}
+head(censo_raw)
+```
+
+```{r}
+head(rais_a_raw)
+```
+```{r}
+head(rais_b_raw)
+```
+```{r}
+head(rais_c_raw)
+```
+
+```{r}
+head(indices_raw)
+```
+```{r}
+head(pop_estimada_raw)
+```
+```{r}
+head(mei_raw)
+```
+
+## Limpeza
+
+```{r}
+pop_estimada <- pop_estimada_raw %>% 
+    janitor::clean_names() %>% 
+    select(c(ano, municipio_codigo, municipio, valor)) %>% 
+    mutate(
+        uf = municipio %>% str_sub(-2,-1),
+        municipio = municipio %>%
+            str_sub(1,-6) %>% 
+            str_to_lower() %>% 
+            abjutils::rm_accent()
+    ) %>% 
+    rename(id_ibge = municipio_codigo) %>% 
+    filter(uf == 'SC' | uf == 'SP') %>% 
+    relocate(ano, uf) %>% 
+    arrange(ano, uf)
+
+head(pop_estimada)
+```
+Uma tibble contendo a relação entre o codigo ibge, nome do municipio e uf será útil
+
+```{r}
+mapping_id_nome <- pop_estimada %>% 
+    select(c(uf, id_ibge, municipio)) %>% 
+    distinct()
+```
+
+```{r}
+indices <- indices_raw %>% 
+    rename(municipio = 1, gini = 2, idhm = 3) %>% 
+    filter(municipio != 'Brasil') %>% 
+    mutate(uf = municipio %>% str_sub(-3,-2),
+           municipio = municipio %>%
+            str_sub(1,-6) %>% 
+            str_to_lower() %>% 
+            abjutils::rm_accent()) %>% 
+    left_join(mapping_id_nome) %>% 
+    relocate(uf, id_ibge)
+
+head(indices)
+```
+
+Os dados coletados do censo são muito ricos. Transformações de suas variáveis serão feitas em outra etapa. 
+
+```{r}
+censo <- censo_raw %>% 
+    rename(id_ibge = id_municipio, uf = sigla_uf) %>% 
+    mutate(id_ibge = id_ibge %>% as.character()) %>% 
+    left_join(mapping_id_nome) %>% 
+    relocate(uf, id_ibge, municipio) %>% 
+    mutate(across(where(is.numeric), ~round(.x, 0)))
+
+head(censo)
+```
+
+```{r}
+pib_mun <- pib_mun_raw %>% 
+    janitor::clean_names() %>% 
+    select(c(ano, municipio, variavel, valor)) %>% 
+    mutate(uf = municipio %>% str_sub(-3,-2),
+           municipio = municipio %>%
+            str_sub(1,-6) %>% 
+            str_to_lower() %>% 
+            abjutils::rm_accent()) %>% 
+    filter(uf == 'SC' | uf == 'SP') %>% 
+    left_join(mapping_id_nome) %>% 
+    relocate(ano, uf, id_ibge) %>% 
+    pivot_wider(names_from = variavel, values_from = valor) %>% 
+    rename(
+        pib = 5,
+        va_total = 6,
+        va_agro = 7,
+        va_ind = 8, 
+        va_serv = 9,
+        va_pub = 10
+    ) %>% 
+    mutate(across(c(7:10), ~.x/va_total),
+           across(where(is.numeric), ~round(.x, 2)))
+
+head(pib_mun)
+```
+
+Os dados que serão utilizados para criação do grupo de controle: 
+
+```{r}
+rais_psm <- rais_a_raw %>% 
+    left_join(rais_b_raw) %>% 
+    rename(id_ibge = id_municipio, uf = sigla_uf) %>% 
+    left_join(mapping_id_nome) %>% 
+    relocate(uf, id_ibge, municipio)
+
+head(rais_psm)
+```
+
+```{r}
+rais_emp <- rais_c_raw %>% 
+    rename(id_ibge = id_municipio, uf = sigla_uf) %>% 
+    mutate(id_ibge = id_ibge %>% as.character()) %>% 
+    left_join(mapping_id_nome) %>% 
+    relocate(uf, id_ibge, municipio)
+
+head(rais_emp)
+```
+
+```{r}
+mei <- mei_raw %>% 
+    unnest(dados) %>% 
+    rename(municipio = 3, qtd_mei = 4) %>% 
+    mutate(
+        municipio = municipio %>% str_to_lower(),
+        municipio = municipio %>% str_replace('d oeste', "d'oeste"),
+        uf = case_when(
+               uf == 'SÃO PAULO' ~ 'SP',
+               uf == 'SANTA CATARINA' ~ 'SC'),
+        municipio = case_when(
+            municipio == 'biritiba-mirim' ~ 'biritiba mirim',
+            municipio == 'embu' ~ 'embu das artes',
+            municipio == 'mogi-guacu' ~ 'mogi guacu',
+            municipio == 'mogi-morim' ~ 'mogi mirim',
+            municipio == "sao joao do pau d alho" ~ "sao joao do pau d'alho",
+            municipio == 'balneario de picarras' ~ 'balneario picarras',
+            municipio == 'presidente castelo branco' ~ 'presidente castello branco',
+            municipio == "sao lourenco d'oeste" ~ 'sao lourenco do oeste',
+            municipio == "sao miguel d'oeste" ~ 'sao miguel do oeste',
+            T ~ municipio
+        )) %>% 
+    left_join(mapping_id_nome)
+
+head(mei)
+```
+
+### Organizando as informações
+
+Nesta etapa, iremos ir além da padronização das tabelas.
+
+O objetivo é o cálculo de composições das variáveis, por exemplo, ao comparar municipios, o interesse maior é o pib per capita, não o número do pib total, ou então, a importância da agricultura e não o valor absoluto. 
+
+Outra necessidade para o processo de modelagem é a interpolação da PEA. Uitilizaremos o crescimento populacional estimado para o IBGE como _proxy_ para o crescimento da PEA. 
+
+Por fim, as bases devem estar agrupadas em 2 conjuntos. O primeiro, necessário ao PSM e o segundo necessário ao diff-diff. 
+
+```{r}
+merged_psm <- censo %>% 
+    mutate(
+        tx_maioridade = pop_maioridade / pop,
+        tx_dinheiro = ocupado_maioridade_dinheiro / ocupada_maioridade,
+        tx_desemprego = desocupada_maioridade / pea_maioridade,
+        tx_pea = pea_maioridade / pop_maioridade,
+        tx_clt = ocupacao_clt / ocupada_maioridade,
+        tx_militar = ocupacao_militar / ocupada_maioridade,
+        tx_publico = ocupacao_publico / ocupada_maioridade,
+        tx_sem_carteita = ocupacao_sem_carteira / ocupada_maioridade,
+        tx_conta_propria = ocupacao_conta_propria / ocupada_maioridade,
+        tx_empregador = ocupacao_empregador / ocupada_maioridade,
+        renda_media = massa_salario_maioridade / ocupado_maioridade_dinheiro
+        ) %>% 
+    left_join(indices) %>% 
+    left_join(pib_mun) %>% 
+    mutate(pib_capita = pib/pop) %>% 
+    select(-c(pop, pib, va_total)) %>% 
+    left_join(rais_psm %>% mutate(ano = ano %>% as.character())) %>% 
+    mutate(
+        tx_rais_negativa = rais_negativa / qtd_total_empresas,
+        tx_agro_extraca = agro_extracao / total_estoque,
+        tx_ind_const = industria_construcao / total_estoque,
+        tx_siup = siup / total_estoque,
+        tx_comercio = comercio / total_estoque,
+        tx_serv = servico / total_estoque
+    ) %>% 
+    select(-c(rais_negativa, qtd_total_empresas, agro_extracao, 
+              industria_construcao, siup, comercio, servico,
+              total_estoque)) %>% 
+    mutate(across(where(is.numeric), ~ round(.x, 2)),
+           tratamento = case_when(
+               uf == 'SC' ~ 1, 
+               uf == 'SP' ~ 0
+           )) %>% 
+    na.omit()
+    
+head(merged_psm)
+```
+
+# Modelagem 
+
+## Pareamento
+
+### Especificando modelos logit
+
+```{r}
+logit_v1 <- glm(tratamento ~ 
+                    tx_maioridade +
+                    tx_dinheiro +
+                    tx_desemprego + 
+                    tx_pea + 
+                    tx_clt + 
+                    tx_militar +
+                    tx_publico + 
+                    tx_sem_carteita + 
+                    tx_conta_propria + 
+                    tx_empregador + 
+                    renda_media +
+                    gini +
+                    idhm +
+                    va_agro +
+                    va_ind + 
+                    va_serv + 
+                    va_pub + 
+                    pib_capita +
+                    tx_rais_negativa +
+                    tx_agro_extraca +
+                    tx_ind_const +
+                    tx_siup +
+                    tx_comercio +
+                    tx_serv,
+                family = binomial(), data = merged_psm)
+```
+A função 'glm' para rodar o logit solta um alerta indicando que as covariadas produzem completa ou quase completa separação da amostra. Isto pode levar o estimador maximum likelihood ao infinito. 
+
+Pode-se arrumar este problema usando o pacote 'brglm', o pacote utiliza penalização para remover o viés, um método desenvolvido pelo Firth (1993). 
+Aproveita-se e fazemos a especimetria
+
+```{r}
+logit_v2 <- brglm(tratamento ~ 
+                    tx_maioridade +
+                    tx_desemprego + 
+                    tx_clt + 
+                    tx_sem_carteita + 
+                    tx_conta_propria + 
+                    tx_empregador + 
+                    renda_media +
+                    gini +
+                    idhm +
+                    va_agro +
+                    va_ind + 
+                    va_serv + 
+                    pib_capita +
+                    tx_rais_negativa +
+                    tx_agro_extraca +
+                    tx_ind_const +
+                    tx_serv,
+                family = binomial(), data = merged_psm)
+
+summary(logit_v2)
+```
+Além da v2, teremos a v3 com o nível de confiança maior
+
+```{r}
+logit_v3 <- brglm(tratamento ~ 
+                    tx_maioridade +
+                    tx_desemprego + 
+                    tx_clt + 
+                    tx_sem_carteita + 
+                    renda_media +
+                    gini +
+                    tx_rais_negativa +
+                    tx_agro_extraca +
+                    tx_serv,
+                family = binomial(), data = merged_psm)
+
+summary(logit_v3)
+
+```
+Agora, mantendo apenas com 95% de confiança
+
+```{r}
+logit_v4 <- brglm(tratamento ~ 
+                    tx_maioridade +
+                    tx_desemprego + 
+                    tx_clt + 
+                    tx_sem_carteita + 
+                    tx_rais_negativa +
+                    tx_agro_extraca,
+                family = binomial(), data = merged_psm)
+
+summary(logit_v4)
+```
+
+### Dando o Match
+
+Podemos utilizar o método do vizinho mais próxi via o pacote 'Matchit'. O pacote é um wrapper do glm, já calculando a propensão e fazendo o pareamento. Como utilizamos uma estimação com penalização, passaremos os scores direto para a função. 
+
+Além disto, serão plotados gráficos e tabela sumárias. 
+
+Primeiramente, vejamos como os dados se comportam sem o pareamento:
+
+```{r}
+#Coleta o score de propensão do modelo com penalização
+score_v2 <- predict(logit_v2, type = 'response')
+```
+
+```{r}
+sem_pareamento <- matchit(tratamento ~ 
+                    tx_maioridade +
+                    tx_desemprego + 
+                    tx_clt + 
+                    tx_sem_carteita + 
+                    tx_conta_propria + 
+                    tx_empregador + 
+                    renda_media +
+                    gini +
+                    idhm +
+                    va_agro +
+                    va_ind + 
+                    va_serv + 
+                    pib_capita +
+                    tx_rais_negativa +
+                    tx_agro_extraca +
+                    tx_ind_const +
+                    tx_serv,
+                    method = NULL, data = merged_psm,
+                    distance = score_v2)
+```
+
+```{r}
+summary(sem_pareamento)
+```
+```{r}
+plot(sem_pareamento, type = 'jitter', interactive = F)
+```
+
+#### logit v2
+```{r}
+match_model_v2 <- matchit(tratamento ~ 
+                    tx_maioridade +
+                    tx_desemprego + 
+                    tx_clt + 
+                    tx_sem_carteita + 
+                    tx_conta_propria + 
+                    tx_empregador + 
+                    renda_media +
+                    gini +
+                    idhm +
+                    va_agro +
+                    va_ind + 
+                    va_serv + 
+                    pib_capita +
+                    tx_rais_negativa +
+                    tx_agro_extraca +
+                    tx_ind_const +
+                    tx_serv,
+                    method = 'nearest', data = merged_psm,
+                    distance = score_v2, ratio = 1,
+                    discard = 'both')
+```
+
+```{r}
+summary(match_model_v2)
+```
+
+```{r}
+plot(match_model_v2, type = 'jitter', interactive = F)
+```
+
+Façamos uma função para plotar o KDE, usando score externo ao pacote matchit:
+
+```{r}
+create_all_facets <- function(df, col){
+  df$facet <- df[[col]]
+  temp <- df
+  temp$facet <- "all"
+  merged <-rbind(temp, df)
+
+  # ensure the facet value is a factor
+  merged[[col]] <- as.factor(merged[[col]])
+
+  return(merged)
+}
+
+plot_kde <- function(matched_df, scores) {
+    df <- merged_psm %>% 
+        mutate(
+            pareado = ifelse(id_ibge %in% matched_df$id_ibge, 'Pareado', 'Nao'),
+            type = ifelse(tratamento == 1, 'Tratamento', 'Controle'),
+            score = scores)
+    
+    new_df <- create_all_facets(df, 'pareado') %>% 
+        filter(facet != 'Nao')
+    
+    ggplot(data=new_df, aes(x=score)) +
+        geom_histogram(aes(fill=type), alpha = 0.4)  +
+        facet_wrap(~facet, scale = 'free') +
+        theme(legend.position = "bottom")
+}
+```
+
+
+```{r}
+plot_kde(match.data(match_model_v2), score_v2)
+```
+
+#### logit v3 
+
+```{r}
+score_v3 <- predict(logit_v3, type = 'response')
+```
+
+```{r}
+match_model_v3 <- matchit(tratamento ~ 
+                    tx_maioridade +
+                    tx_desemprego + 
+                    tx_clt + 
+                    tx_sem_carteita + 
+                    renda_media +
+                    gini +
+                    tx_rais_negativa +
+                    tx_agro_extraca +
+                    tx_serv,
+                    method = 'nearest', data = merged_psm,
+                    distance = score_v3, ratio = 1,
+                    discard = 'both')
+```
+
+
+```{r}
+summary(match_model_v3)
+```
+
+```{r}
+plot(match_model_v3, type = 'jitter', interactive = F)
+```
+
+```{r}
+plot_kde(match.data(match_model_v3), score_v3)
+```
+
+#### Logit v4
+
+```{r}
+score_v4 <- predict(logit_v4, type = 'response')
+```
+
+```{r}
+match_model_v4 <- matchit(tratamento ~ 
+                    tx_maioridade +
+                    tx_desemprego + 
+                    tx_clt + 
+                    tx_sem_carteita + 
+                    tx_rais_negativa +
+                    tx_agro_extraca,
+                    method = 'nearest', data = merged_psm,
+                    distance = score_v4, ratio = 1,
+                    discard = 'both')
+```
+
+```{r}
+summary(match_model_v4)
+```
+```{r}
+plot(match_model_v4, type = 'jitter', interactive = F)
+```
+```{r}
+plot_kde(match.data(match_model_v4), score_v4)
+```
+
+A versão que possui mais municípios pareados é a v3, apesar de ter mais covariadas que a versão 4. Na versão 3 ela também possui uam distribuição maior no histograma. É esta a versão que iremos utilizar.
+
+Nota-se que o pareamento não ficou muito próximo e excluiu vários municípios, apesar de ter melhorado o histoigrama e o balanceamento, na média. 
+
+## Diferenças em diferenças
+
+A última etapa é calcular o impacto médio do programa, tendo em vista que utilizaremos apenas municipios similares, em média, nas variáveis selecionadas, ou seja, foi possível um certo nível de balanceamento das covariadas. 
+
+### Interpolação da PEA
+
+O dado de PEA está disponível a nível municipal apenas via Censo. Como a variável de interesse é MEI / PEA, faz-se encessário estimar a PEA em 2019. Faremos isto utilizando a mesma taxa de cresscimento populacional, estimado pelo IBGE. 
+
+#### Cálculo da taxa de crescimento da população
+
+```{r}
+pop_tx_cresc <- pop_estimada %>% 
+    pivot_wider(names_from = ano, values_from = valor, names_prefix = 'pop_') 
+
+head(pop_tx_cresc)
+```
+
+```{r}
+pea_interpolada <- censo %>% 
+    select(c(uf, id_ibge, municipio, pea_maioridade, pop)) %>% 
+    rename(pop_2010 = pop, pea_2010 = pea_maioridade) %>% 
+    left_join(pop_tx_cresc) %>% 
+    mutate(
+        tx_cresc_t1 = (pop_2011 - pop_2010) / pop_2010,
+        tx_cresc_t2 = (pop_2019 - pop_2011) / pop_2011,
+        pea_2011 = pea_2010 * (1 + tx_cresc_t1),
+        pea_2019 = pea_2011 * (1 + tx_cresc_t2),
+        across((starts_with('pea_')), ~round(.x,0))
+    ) %>% 
+    select(-c(starts_with('pop'), starts_with('tx_'), pea_2010))
+
+head(pea_interpolada)
+```
+```{r}
+mei_cleaned <- mei %>% 
+    mutate(
+        date = date %>%
+            str_sub(-4,-1),
+        qtd_mei = qtd_mei %>% 
+            str_replace_all('\\.', '') %>% 
+            as.numeric()
+        ) %>% 
+    pivot_wider(names_from = date, values_from = qtd_mei, names_prefix = 'mei_') 
+
+head(mei_cleaned)
+```
+
+### Base de dados para did
+
+```{r}
+base_did <- pea_interpolada %>% 
+    left_join(mei_cleaned) %>% 
+    mutate(
+        tx_mei_2011 = mei_2011 / pea_2011 * 100,
+        tx_mei_2019 = mei_2019 / pea_2019 * 100,
+        tx_mei_2011 = tx_mei_2011 %>% 
+            round(2),
+        tx_mei_2019 = tx_mei_2019 %>% 
+            round(2)) %>% 
+    select(-c(starts_with('mei_'), starts_with('pea_'))) %>% 
+    pivot_longer(cols = starts_with('tx_mei'), values_to = 'tx_mei') %>% 
+    mutate(
+        tratamento = ifelse(uf == 'SC', 1, 0), 
+        periodo = ifelse(str_sub(name, -4, -1) == '2011', 0, 1),
+        did = tratamento * periodo) %>% 
+    select(-c(name)) %>% 
+    relocate(c(uf, id_ibge, municipio, tx_mei, periodo, tratamento, did)) %>% 
+    left_join(merged_psm %>% 
+                  select(-c(4:17, ano)))
+
+head(base_did)
+```
+
+#### Regressao com a base completa
+
+```{r}
+reg_completa_sem <- lm(tx_mei ~
+                           tratamento + periodo + did, 
+                       data = base_did)
+```
+
+```{r}
+summary(reg_completa_sem)
+```
+
+```{r}
+reg_completa_com <- lm(tx_mei ~
+                           tratamento + periodo + did +
+                           tx_maioridade + 
+                           tx_dinheiro + 
+                           tx_pea +
+                           tx_clt + 
+                           tx_publico + 
+                           tx_empregador + 
+                           gini + 
+                           idhm +
+                           va_agro +
+                           va_ind + 
+                           tx_ind_const +
+                           tx_serv,
+                       data = base_did)
+
+```
+
+```{r}
+summary(reg_completa_com)
+```
+
+## Regs com municipio pareado
+
+```{r}
+municipios_pareados <- base_did %>% 
+    filter(id_ibge %in% match.data(match_model_v3)$id_ibge)
+```
+
+```{r}
+reg_amostra_sem <- lm(tx_mei ~
+                          tratamento + periodo + did, 
+                      data = municipios_pareados) 
+```
+
+```{r}
+summary(reg_amostra_sem)
+```
+
+```{r}
+reg_amostra_com <- lm(tx_mei ~
+                           tratamento + periodo + did +
+                           tx_maioridade + 
+                           tx_pea +
+                           tx_conta_propria + 
+                           gini + 
+                           idhm +
+                           va_agro +
+                           va_ind + 
+                           va_serv + 
+                           va_pub,
+                       data = municipios_pareados)
+summary(reg_amostra_com)
+```
+
+#### Entendimento
+
+Quando usa a base inteira, a taxa de MEI em municipios de SC foi menor que em SP, em 1,65 p.p em média. 
+Já ao utilizar a base pareada essa diferença é, estatisticamente, igual a 0. 
+
+Ou seja, a diferença de crescimento entre SC e SP antes negativa passa a ser 0. Este resultado somado ao pareamento não preciso que foi possível obter, é indício de que o programa teve efeito, mas os municípios de SP e SC são inerentemente muito diferentes, oq impossibilitou um resultado positivo para o did pós pareamento. 
+
+
+
+
+
+
+
+

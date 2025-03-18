@@ -35,14 +35,8 @@ vignettes/*.pdf
 # Shiny token, see https://shiny.rstudio.com/articles/shinyapps.html
 rsconnect/
 
-# Notebook
-*.nb
 
 # Data files
 *.rds
-
-# Markdown
-*.Rmd
-
-# Other file formats
-*.png
+*.xlsx
+*.xls
